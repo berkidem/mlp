@@ -226,8 +226,8 @@ print("Reading data done")
 
 # create the model
 context_length = 3 # if 3 tokens predict the 4th, this is a 4-gram model
-embedding_size = 48
-hidden_size = 512
+embedding_size = 1024
+hidden_size = 4096
 init_rng = RNG(1337)
 # these two classes both produce the exact same results. One uses nn.Module the other doesn't.
 # model = MLPRaw(vocab_size, context_length, embedding_size, hidden_size, init_rng)
@@ -249,15 +249,36 @@ else:
     model.fc2_bias = model.fc2_bias.to(device)
 
 # create the optimizer
-learning_rate = 7e-4
+learning_rate = 1e-3
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
 
 # training loop
 timer = StepTimer()
-batch_size = 1024
-num_steps = 1_000_000
+batch_size = 2**16
+
+# Calculate steps per epoch based on dataset size
+tokens_per_epoch = len(train_tokens)
+steps_per_epoch = tokens_per_epoch // batch_size
+log_interval = max(1, int(steps_per_epoch * 0.1))  # Log 10 times per epoch
+num_epochs = 10  # You can adjust this to control training duration
+num_steps = steps_per_epoch * num_epochs
+
+print(f'Dataset size: {tokens_per_epoch:,} tokens')
+print(f'Steps per epoch: {steps_per_epoch:,} (with batch_size={batch_size})')
+print(f'Logging interval: {log_interval} steps (0.1 epochs)')
+print(f'Training for {num_epochs} epochs = {num_steps:,} steps')
 print(f'num_steps {num_steps}, num_epochs {num_steps * batch_size / len(train_tokens):.2f}')
 train_data_iter = dataloader(train_tokens, context_length, batch_size, device)
+
+# Create checkpoint directory if it doesn't exist
+checkpoint_dir = "checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+# Initialize best validation loss tracking
+best_val_loss = float('inf')
+best_step = -1
+best_model_path = None
+
 for step in range(num_steps):
     # cosine learning rate schedule, from max lr to 0
     lr = learning_rate * 0.5 * (1 + math.cos(math.pi * step / num_steps))
@@ -265,10 +286,136 @@ for step in range(num_steps):
         param_group['lr'] = lr
     # every now and then evaluate the validation loss
     last_step = step == num_steps - 1
-    if step % 200 == 0 or last_step:
+    if step % log_interval == 0 or last_step:
         train_loss = eval_split(model, train_tokens, max_batches=20, device=device)
         val_loss = eval_split(model, val_tokens, device=device)
-        print(f'step {step:6d} | train_loss {train_loss:.6f} | val_loss {val_loss:.6f} | lr {lr:e} | time/step {timer.get_dt()*1000:.4f}ms')
+        epoch_progress = (step % steps_per_epoch) / steps_per_epoch
+        current_epoch = step // steps_per_epoch
+        print(f'epoch {current_epoch:.1f} | step {step:6d} | train_loss {train_loss:.6f} | val_loss {val_loss:.6f} | lr {lr:e} | time/step {timer.get_dt()*1000:.4f}ms')
+        
+        # Save checkpoint if this is the best validation loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_step = step
+            
+            # Create checkpoint
+            if isinstance(model, MLPRaw):
+                model_type = "mlp_raw"
+                # For MLPRaw, save the parameters
+                save_dict = {
+                    'wte': model.wte,
+                    'fc1_weights': model.fc1_weights,
+                    'fc1_bias': model.fc1_bias,
+                    'fc2_weights': model.fc2_weights,
+                    'fc2_bias': model.fc2_bias,
+                    'params': {
+                        'vocab_size': vocab_size,
+                        'context_length': context_length,
+                        'embedding_size': embedding_size,
+                        'hidden_size': hidden_size
+                    },
+                    'step': step,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'best_val_loss': best_val_loss
+                }
+            else:
+                model_type = "mlp_module"
+                # For nn.Module models, save the state_dict
+                save_dict = {
+                    'model_state_dict': model.state_dict(),
+                    'params': {
+                        'vocab_size': vocab_size,
+                        'context_length': context_length,
+                        'embedding_size': embedding_size,
+                        'hidden_size': hidden_size
+                    },
+                    'step': step,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'best_val_loss': best_val_loss
+                }
+            
+            # Use a consistent filename for the best model, overwriting previous best
+            best_model_filename = f"{checkpoint_dir}/best_model_{model_type}.pt"
+            torch.save(save_dict, best_model_filename)
+            best_model_path = best_model_filename
+            # print(f"New best model saved to {best_model_filename} (val_loss: {val_loss:.6f}, step: {step})")
+            
+            # Log the checkpoint in the tracking file
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_file = "model_tracking.csv"
+            log_exists = os.path.exists(log_file)
+            
+            with open(log_file, mode='a', newline='') as f:
+                fieldnames = ['timestamp', 'model_type', 'context_length', 'embedding_size', 
+                            'hidden_size', 'learning_rate', 'train_loss', 'val_loss', 
+                            'step', 'is_best', 'filename']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                
+                if not log_exists:
+                    writer.writeheader()
+                
+                writer.writerow({
+                    'timestamp': timestamp,
+                    'model_type': model_type,
+                    'context_length': context_length,
+                    'embedding_size': embedding_size,
+                    'hidden_size': hidden_size,
+                    'learning_rate': learning_rate,
+                    'train_loss': f"{train_loss:.6f}",
+                    'val_loss': f"{val_loss:.6f}",
+                    'step': step,
+                    'is_best': True,
+                    'filename': best_model_filename
+                })
+        
+        # Also save regular checkpoints at the end of each epoch
+        current_epoch = step // steps_per_epoch
+        next_step = (step + 1) // steps_per_epoch
+        if current_epoch != next_step or last_step:  # If we're changing epochs or at the last step
+            checkpoint_filename = f"{checkpoint_dir}/checkpoint_{model_type}_epoch{current_epoch}.pt"
+            if isinstance(model, MLPRaw):
+                checkpoint_dict = {
+                    'wte': model.wte,
+                    'fc1_weights': model.fc1_weights,
+                    'fc1_bias': model.fc1_bias,
+                    'fc2_weights': model.fc2_weights,
+                    'fc2_bias': model.fc2_bias,
+                    'params': {
+                        'vocab_size': vocab_size,
+                        'context_length': context_length,
+                        'embedding_size': embedding_size,
+                        'hidden_size': hidden_size
+                    },
+                    'step': step,
+                    'epoch': current_epoch,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'best_val_loss': best_val_loss
+                }
+            else:
+                checkpoint_dict = {
+                    'model_state_dict': model.state_dict(),
+                    'params': {
+                        'vocab_size': vocab_size,
+                        'context_length': context_length,
+                        'embedding_size': embedding_size,
+                        'hidden_size': hidden_size
+                    },
+                    'step': step,
+                    'epoch': current_epoch,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'best_val_loss': best_val_loss
+                }
+            torch.save(checkpoint_dict, checkpoint_filename)
+            print(f"Epoch {current_epoch} completed - Checkpoint saved to {checkpoint_filename}")
+
     # training step
     with timer:
         # get the next batch of training data
@@ -349,7 +496,7 @@ log_exists = os.path.exists(log_file)
 with open(log_file, mode='a', newline='') as f:
     fieldnames = ['timestamp', 'model_type', 'context_length', 'embedding_size', 
                   'hidden_size', 'learning_rate', 'train_loss', 'val_loss', 
-                  'test_loss', 'model_filename', 'num_steps']
+                  'test_loss', 'model_filename', 'num_steps', 'best_val_loss', 'best_step']
     writer = csv.DictWriter(f, fieldnames=fieldnames)
     
     if not log_exists:
@@ -370,7 +517,10 @@ with open(log_file, mode='a', newline='') as f:
         'val_loss': f"{final_val_loss:.6f}",
         'test_loss': f"{test_loss:.6f}",
         'model_filename': model_filename,
-        'num_steps': num_steps
+        'num_steps': num_steps,
+        'best_val_loss': f"{best_val_loss:.6f}",
+        'best_step': best_step
     })
 
 print(f"Training info logged to {log_file}")
+print(f"Best validation loss: {best_val_loss:.6f} at step {best_step}")
