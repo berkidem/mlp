@@ -3,9 +3,14 @@ Implements a simple n-gram language model in PyTorch.
 Acts as the correctness reference for all the other versions.
 """
 import math
+import pickle
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import os
+import datetime
+import csv
 
 from common import RNG, StepTimer
 
@@ -47,6 +52,8 @@ class MLPRaw:
         B, T = idx.size()
         # forward pass
         # encode all the tokens using the embedding table
+        # FIX: turn off the next row
+        idx = idx.long()
         emb = self.wte[idx] # (B, T, embedding_size)
         # concat all of the embeddings together
         emb = emb.view(B, -1) # (B, T * embedding_size)
@@ -56,6 +63,8 @@ class MLPRaw:
         # if we are given desired targets, also calculate the loss
         loss = None
         if targets is not None:
+            # FIX: turn off the next row
+            targets = targets.long()
             loss = F.cross_entropy(logits, targets)
         return logits, loss
 
@@ -116,7 +125,7 @@ class MLP(nn.Module):
 # -----------------------------------------------------------------------------
 # simple DataLoader that iterates over all the n-grams
 
-def dataloader(tokens, context_length, batch_size):
+def dataloader(tokens, context_length, batch_size, device=torch.device('cpu')):
     # returns inputs, targets as torch Tensors of shape (B, T), (B, )
     n = len(tokens)
     inputs, targets = [], []
@@ -128,7 +137,9 @@ def dataloader(tokens, context_length, batch_size):
         targets.append(window[-1])
         # once we've collected a batch, emit it
         if len(inputs) == batch_size:
-            yield (torch.tensor(inputs), torch.tensor(targets))
+            # Convert to long tensors (int64) before sending to device
+            yield (torch.tensor(inputs, dtype=torch.long).to(device), 
+                   torch.tensor(targets, dtype=torch.long).to(device))
             inputs, targets = [], []
         # advance the position and wrap around if we reach the end
         pos += 1
@@ -139,13 +150,13 @@ def dataloader(tokens, context_length, batch_size):
 # evaluation function
 
 @torch.inference_mode()
-def eval_split(model, tokens, max_batches=None):
+def eval_split(model, tokens, max_batches=None, device=torch.device('cpu')):
     # calculate the loss on the given tokens
     total_loss = 0
     num_batches = len(tokens) // batch_size
     if max_batches is not None:
         num_batches = min(num_batches, max_batches)
-    data_iter = dataloader(tokens, context_length, batch_size)
+    data_iter = dataloader(tokens, context_length, batch_size, device)
     for _ in range(num_batches):
         inputs, targets = next(data_iter)
         logits, loss = model(inputs, targets)
@@ -177,17 +188,41 @@ def sample_discrete(probs, coinf):
 # let's train!
 
 # "train" the Tokenizer, so we're able to map between characters and tokens
-train_text = open('data/train.txt', 'r').read()
-assert all(c == '\n' or ('a' <= c <= 'z') for c in train_text)
-uchars = sorted(list(set(train_text))) # unique characters we see in the input
+with open("data/train_sequences.pkl", "rb") as f:
+    train_text = pickle.load(f)
+
+max_num = max(max(seq) for seq in train_text)
+min_num = min(min(seq) for seq in train_text)
+assert (min_num == 0) & (max_num == 1016)
+uchars = list(set([item for sublist in train_text for item in sublist]))
+uchars = sorted(uchars)
 vocab_size = len(uchars)
-char_to_token = {c: i for i, c in enumerate(uchars)}
-token_to_char = {i: c for i, c in enumerate(uchars)}
-EOT_TOKEN = char_to_token['\n'] # designate \n as the delimiting <|endoftext|> token
-# pre-tokenize all the splits one time up here
-test_tokens = [char_to_token[c] for c in open('data/test.txt', 'r').read()]
-val_tokens = [char_to_token[c] for c in open('data/val.txt', 'r').read()]
-train_tokens = [char_to_token[c] for c in open('data/train.txt', 'r').read()]
+print(f"vocab_size: {vocab_size}")
+
+encoding = pd.read_parquet("data/onet_name_encoding.parquet")
+char_to_token = encoding.set_index("BGI_ONET_NAME")["BGI_ONET_NAME_ENCODED"].to_dict()
+
+EOT_TOKEN = 1016  # designate 1016 as the delimiting <END_OF_TEXT> token
+char_to_token["<END_OF_TEXT>"] = EOT_TOKEN
+token_to_char = {v: k for k, v in char_to_token.items()}
+
+# # pre-tokenize all the splits one time up here
+# test_tokens = [char_to_token[c] for c in open("data/test.txt", "r").read()]
+# val_tokens = [char_to_token[c] for c in open("data/val.txt", "r").read()]
+# train_tokens = [char_to_token[c] for c in open("data/train.txt", "r").read()]
+
+with open("data/train_sequences.pkl", "rb") as f:
+    train_tokens = pickle.load(f)
+with open("data/val_sequences.pkl", "rb") as f:
+    val_tokens = pickle.load(f)
+with open("data/test_sequences.pkl", "rb") as f:
+    test_tokens = pickle.load(f)
+
+train_tokens = [item for sublist in train_tokens for item in sublist]
+val_tokens = [item for sublist in val_tokens for item in sublist]
+test_tokens = [item for sublist in test_tokens for item in sublist]
+
+print("Reading data done")
 
 # create the model
 context_length = 3 # if 3 tokens predict the 4th, this is a 4-gram model
@@ -195,8 +230,23 @@ embedding_size = 48
 hidden_size = 512
 init_rng = RNG(1337)
 # these two classes both produce the exact same results. One uses nn.Module the other doesn't.
-model = MLPRaw(vocab_size, context_length, embedding_size, hidden_size, init_rng)
-# model = MLP(vocab_size, context_length, embedding_size, hidden_size, init_rng)
+# model = MLPRaw(vocab_size, context_length, embedding_size, hidden_size, init_rng)
+model = MLP(vocab_size, context_length, embedding_size, hidden_size, init_rng)
+
+# Check if GPU is available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Move model to device (for MLP which is nn.Module)
+if isinstance(model, nn.Module):
+    model = model.to(device)
+# For MLPRaw, move all tensors to device
+else:
+    model.wte = model.wte.to(device)
+    model.fc1_weights = model.fc1_weights.to(device)
+    model.fc1_bias = model.fc1_bias.to(device)
+    model.fc2_weights = model.fc2_weights.to(device)
+    model.fc2_bias = model.fc2_bias.to(device)
 
 # create the optimizer
 learning_rate = 7e-4
@@ -204,10 +254,10 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay
 
 # training loop
 timer = StepTimer()
-batch_size = 128
-num_steps = 50000
+batch_size = 1024
+num_steps = 1_000_000
 print(f'num_steps {num_steps}, num_epochs {num_steps * batch_size / len(train_tokens):.2f}')
-train_data_iter = dataloader(train_tokens, context_length, batch_size)
+train_data_iter = dataloader(train_tokens, context_length, batch_size, device)
 for step in range(num_steps):
     # cosine learning rate schedule, from max lr to 0
     lr = learning_rate * 0.5 * (1 + math.cos(math.pi * step / num_steps))
@@ -216,8 +266,8 @@ for step in range(num_steps):
     # every now and then evaluate the validation loss
     last_step = step == num_steps - 1
     if step % 200 == 0 or last_step:
-        train_loss = eval_split(model, train_tokens, max_batches=20)
-        val_loss = eval_split(model, val_tokens)
+        train_loss = eval_split(model, train_tokens, max_batches=20, device=device)
+        val_loss = eval_split(model, val_tokens, device=device)
         print(f'step {step:6d} | train_loss {train_loss:.6f} | val_loss {val_loss:.6f} | lr {lr:e} | time/step {timer.get_dt()*1000:.4f}ms')
     # training step
     with timer:
@@ -233,25 +283,94 @@ for step in range(num_steps):
 
 # model inference
 # hardcode a prompt from which we'll continue the text
-sample_rng = RNG(42)
-prompt = "\nrichard"
-context = [char_to_token[c] for c in prompt]
-assert len(context) >= context_length
-context = context[-context_length:] # crop to context_length
-print(prompt, end='', flush=True)
-# now let's sample 200 more tokens that follow
-with torch.inference_mode():
-    for _ in range(200):
-        # take the last context_length tokens and predict the next one
-        context_tensor = torch.tensor(context).unsqueeze(0) # (1, T)
-        logits, _ = model(context_tensor) # (1, V)
-        probs = softmax(logits[0]) # (V, )
-        coinf = sample_rng.random() # "coin flip", float32 in range [0, 1)
-        next_token = sample_discrete(probs, coinf)
-        context = context[1:] + [next_token] # update the token tape
-        print(token_to_char[next_token], end='', flush=True)
-print() # newline
+# sample_rng = RNG(42)
+# prompt = "\nrichard"
+# context = [char_to_token[c] for c in prompt]
+# assert len(context) >= context_length
+# context = context[-context_length:] # crop to context_length
+# print(prompt, end='', flush=True)
+# # now let's sample 200 more tokens that follow
+# with torch.inference_mode():
+#     for _ in range(200):
+#         # take the last context_length tokens and predict the next one
+#         context_tensor = torch.tensor(context).unsqueeze(0) # (1, T)
+#         logits, _ = model(context_tensor) # (1, V)
+#         probs = softmax(logits[0]) # (V, )
+#         coinf = sample_rng.random() # "coin flip", float32 in range [0, 1)
+#         next_token = sample_discrete(probs, coinf)
+#         context = context[1:] + [next_token] # update the token tape
+#         print(token_to_char[next_token], end='', flush=True)
+# print() # newline
 
 # and finally report the test loss
-test_loss = eval_split(model, test_tokens)
+test_loss = eval_split(model, test_tokens, device=device)
 print(f'test_loss {test_loss}')
+
+# Save the trained model
+model_params = f"context{context_length}_emb{embedding_size}_hidden{hidden_size}"
+if isinstance(model, MLPRaw):
+    model_type = "mlp_raw"
+    # For MLPRaw, save the parameters
+    save_dict = {
+        'wte': model.wte,
+        'fc1_weights': model.fc1_weights,
+        'fc1_bias': model.fc1_bias,
+        'fc2_weights': model.fc2_weights,
+        'fc2_bias': model.fc2_bias,
+        'params': {
+            'vocab_size': vocab_size,
+            'context_length': context_length,
+            'embedding_size': embedding_size,
+            'hidden_size': hidden_size
+        }
+    }
+else:
+    model_type = "mlp_module"
+    # For nn.Module models, save the state_dict
+    save_dict = {
+        'model_state_dict': model.state_dict(),
+        'params': {
+            'vocab_size': vocab_size,
+            'context_length': context_length,
+            'embedding_size': embedding_size,
+            'hidden_size': hidden_size
+        }
+    }
+
+model_filename = f"model_{model_type}_{model_params}_loss{test_loss:.4f}.pt"
+torch.save(save_dict, model_filename)
+print(f"Model saved to {model_filename}")
+
+# Log parameters and results to a tracking file
+timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+log_file = "model_tracking.csv"
+log_exists = os.path.exists(log_file)
+
+with open(log_file, mode='a', newline='') as f:
+    fieldnames = ['timestamp', 'model_type', 'context_length', 'embedding_size', 
+                  'hidden_size', 'learning_rate', 'train_loss', 'val_loss', 
+                  'test_loss', 'model_filename', 'num_steps']
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    
+    if not log_exists:
+        writer.writeheader()
+    
+    # Get final train and val loss
+    final_train_loss = eval_split(model, train_tokens, max_batches=20, device=device)
+    final_val_loss = eval_split(model, val_tokens, device=device)
+    
+    writer.writerow({
+        'timestamp': timestamp,
+        'model_type': model_type,
+        'context_length': context_length,
+        'embedding_size': embedding_size,
+        'hidden_size': hidden_size,
+        'learning_rate': learning_rate,
+        'train_loss': f"{final_train_loss:.6f}",
+        'val_loss': f"{final_val_loss:.6f}",
+        'test_loss': f"{test_loss:.6f}",
+        'model_filename': model_filename,
+        'num_steps': num_steps
+    })
+
+print(f"Training info logged to {log_file}")
