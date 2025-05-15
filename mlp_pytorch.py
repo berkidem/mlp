@@ -78,7 +78,7 @@ class MLP(nn.Module):
         self.wte = nn.Embedding(vocab_size, embedding_size) # token embedding table
         self.mlp = nn.Sequential(
             nn.Linear(context_length * embedding_size, hidden_size),
-            nn.Tanh(),
+            nn.ReLU(),
             nn.Linear(hidden_size, vocab_size)
         )
         self.reinit(rng)
@@ -225,7 +225,7 @@ test_tokens = [item for sublist in test_tokens for item in sublist]
 print("Reading data done")
 
 # create the model
-context_length = 3 # if 3 tokens predict the 4th, this is a 4-gram model
+context_length = 2 # if 3 tokens predict the 4th, this is a 4-gram model
 embedding_size = 1024
 hidden_size = 4096
 init_rng = RNG(1337)
@@ -250,11 +250,11 @@ else:
 
 # create the optimizer
 learning_rate = 1e-3
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-
+# optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 # training loop
 timer = StepTimer()
-batch_size = 2**16
+batch_size = 2**12
 
 # Calculate steps per epoch based on dataset size
 tokens_per_epoch = len(train_tokens)
