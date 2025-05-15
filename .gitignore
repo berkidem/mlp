@@ -1,0 +1,7 @@
+config.py
+__pycache__/config.cpython-311.pyc
+*.pkl
+*.npy
+*.txt
+*.parquet
+__pycache__/config.cpython-312.pyc
