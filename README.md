@@ -2,6 +2,8 @@
 
 This is a very exciting module because we tie a lot of things things together and train a Multi-layer Perceptron (MLP) to be an n-gram Language Model, following the paper [A Neural Probabilistic Language Model](https://www.jmlr.org/papers/volume3/bengio03a/bengio03a.pdf) from Bengio et al. 2003.
 
+I generated the career sequences used here from the Burning Glass Institute's profiles data: each sequence is one worker's jobs in chronological order, coded as O*NET occupations. The data and the code that extracts it are not included in this repo, so the pipeline here starts from the resulting `occupation_sequences.pkl`.
+
 We have multiple parallel implementations that all get to the exact same results but in very different ways:
 
 - C version, which fully spells out all the individual operations.
